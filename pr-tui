@@ -1,0 +1,973 @@
+#!/usr/bin/env python3
+"""A small curses TUI for reviewing GitHub pull requests with gh."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import pathlib
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+
+SEARCH_FIELDS = (
+    "assignees,author,commentsCount,createdAt,id,isDraft,labels,number,"
+    "repository,state,title,updatedAt,url"
+)
+
+VIEW_FIELDS = (
+    "additions,assignees,author,baseRefName,body,changedFiles,commits,"
+    "deletions,files,headRefName,isDraft,latestReviews,mergeStateStatus,"
+    "mergeable,number,reviewDecision,reviewRequests,statusCheckRollup,"
+    "title,updatedAt,url"
+)
+
+CHECK_FIELDS = "bucket,completedAt,description,event,link,name,startedAt,state,workflow"
+DEFAULT_UPDATE_REPO = "c-gerke/pr-tui"
+RELEASE_ASSET = "pr-tui"
+
+
+class GhError(Exception):
+    def __init__(self, command: list[str], stderr: str, stdout: str = "", returncode: int = 1):
+        self.command = command
+        self.stderr = stderr.strip()
+        self.stdout = stdout.strip()
+        self.returncode = returncode
+        super().__init__(self.message)
+
+    @property
+    def message(self) -> str:
+        detail = self.stderr or self.stdout or f"exit {self.returncode}"
+        return f"{shell_join(self.command)}\n{detail}"
+
+
+@dataclass
+class Args:
+    owners: list[str]
+    repos: list[str]
+    query: str
+    limit: int
+    state: str
+    refresh_seconds: int
+    include_drafts: bool
+
+
+@dataclass
+class PullRequest:
+    number: int
+    repo: str
+    title: str
+    url: str
+    state: str
+    is_draft: bool
+    author: str
+    updated_at: str
+    created_at: str
+    comments_count: int
+    labels: list[str] = field(default_factory=list)
+    assignees: list[str] = field(default_factory=list)
+    detail: dict[str, Any] | None = None
+    checks: list[dict[str, Any]] | None = None
+    checks_loaded_at: float | None = None
+    detail_loaded_at: float | None = None
+
+    @classmethod
+    def from_json(cls, item: dict[str, Any]) -> "PullRequest":
+        repo = item.get("repository") or {}
+        author = item.get("author") or {}
+        return cls(
+            number=int(item.get("number") or 0),
+            repo=repo.get("nameWithOwner") or repo_name_from_url(item.get("url", "")),
+            title=item.get("title") or "",
+            url=item.get("url") or "",
+            state=item.get("state") or "",
+            is_draft=bool(item.get("isDraft")),
+            author=author.get("login") or "",
+            updated_at=item.get("updatedAt") or "",
+            created_at=item.get("createdAt") or "",
+            comments_count=int(item.get("commentsCount") or 0),
+            labels=[x.get("name", "") for x in item.get("labels") or [] if x.get("name")],
+            assignees=[x.get("login", "") for x in item.get("assignees") or [] if x.get("login")],
+        )
+
+
+@dataclass
+class State:
+    args: Args
+    prs: list[PullRequest] = field(default_factory=list)
+    selected: int = 0
+    offset: int = 0
+    filter_text: str = ""
+    detail_scroll: int = 0
+    checks_scroll: int = 0
+    focus: str = "list"
+    status: str = ""
+    error: str = ""
+    loading: bool = False
+    last_refresh: float = 0
+    dirty: bool = True
+    quit: bool = False
+
+    @property
+    def filtered_prs(self) -> list[PullRequest]:
+        if not self.filter_text:
+            return self.prs
+        needle = self.filter_text.lower()
+        return [
+            pr
+            for pr in self.prs
+            if needle in pr.title.lower()
+            or needle in pr.repo.lower()
+            or needle in pr.author.lower()
+            or needle in str(pr.number)
+            or any(needle in label.lower() for label in pr.labels)
+        ]
+
+    @property
+    def current(self) -> PullRequest | None:
+        prs = self.filtered_prs
+        if not prs:
+            return None
+        self.selected = min(max(self.selected, 0), len(prs) - 1)
+        return prs[self.selected]
+
+
+def main() -> int:
+    parsed = parse_args()
+    if parsed.self_update:
+        return self_update(parsed.update_repo, parsed.update_target)
+    args = Args(
+        owners=parsed.owner or [],
+        repos=parsed.repo or [],
+        query=parsed.query,
+        limit=parsed.limit,
+        state=parsed.state,
+        refresh_seconds=parsed.refresh_seconds,
+        include_drafts=parsed.include_drafts,
+    )
+    try:
+        if parsed.smoke_test:
+            curses.wrapper(lambda stdscr: App(stdscr, args).smoke_test())
+        else:
+            curses.wrapper(lambda stdscr: App(stdscr, args).run())
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Review GitHub pull requests from a keyboard-first TUI backed by gh.",
+    )
+    parser.add_argument(
+        "--owner",
+        action="append",
+        help="Limit search to an owner/org. Repeat for multiple orgs/accounts.",
+    )
+    parser.add_argument(
+        "--repo",
+        action="append",
+        help="Limit search to OWNER/REPO. Repeat for multiple repositories.",
+    )
+    parser.add_argument(
+        "--query",
+        default="review-requested:@me",
+        help='GitHub PR search query. Default: "review-requested:@me".',
+    )
+    parser.add_argument("--limit", type=int, default=50, help="Maximum PRs to fetch.")
+    parser.add_argument("--state", default="open", choices=("open", "closed"), help="PR state.")
+    parser.add_argument(
+        "--refresh-seconds",
+        type=int,
+        default=300,
+        help="Background refresh interval. Use 0 to disable.",
+    )
+    parser.add_argument("--include-drafts", action="store_true", help="Include draft PRs.")
+    parser.add_argument(
+        "--self-update",
+        action="store_true",
+        help="Update this executable from the latest GitHub release.",
+    )
+    parser.add_argument(
+        "--update-repo",
+        help="Repository to update from, in OWNER/REPO form. Defaults to PR_TUI_UPDATE_REPO.",
+    )
+    parser.add_argument(
+        "--update-target",
+        help="Executable path to replace. Defaults to the current pr-tui executable.",
+    )
+    parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+class App:
+    def __init__(self, stdscr: curses.window, args: Args):
+        self.stdscr = stdscr
+        self.state = State(args=args)
+        self.colors: dict[str, int] = {}
+
+    def run(self) -> None:
+        self.setup_curses()
+        self.refresh_prs()
+        while not self.state.quit:
+            self.maybe_auto_refresh()
+            self.draw()
+            key = self.stdscr.getch()
+            if key == -1:
+                continue
+            self.handle_key(key)
+
+    def smoke_test(self) -> None:
+        self.setup_curses()
+        self.state.status = "Smoke test."
+        self.draw()
+
+    def setup_curses(self) -> None:
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.stdscr.timeout(250)
+        self.stdscr.keypad(True)
+        if curses.has_colors():
+            curses.start_color()
+            self.init_pair("muted", curses.COLOR_CYAN, -1)
+            self.init_pair("selected", curses.COLOR_BLACK, curses.COLOR_CYAN)
+            self.init_pair("ok", curses.COLOR_GREEN, -1)
+            self.init_pair("warn", curses.COLOR_YELLOW, -1)
+            self.init_pair("bad", curses.COLOR_RED, -1)
+            self.init_pair("dim", curses.COLOR_BLUE, -1)
+
+    def init_pair(self, name: str, fg: int, bg: int) -> None:
+        idx = len(self.colors) + 1
+        curses.init_pair(idx, fg, bg)
+        self.colors[name] = curses.color_pair(idx)
+
+    def color(self, name: str, fallback: int = 0) -> int:
+        return self.colors.get(name, fallback)
+
+    def maybe_auto_refresh(self) -> None:
+        interval = self.state.args.refresh_seconds
+        if interval <= 0 or self.state.loading:
+            return
+        if self.state.last_refresh and time.time() - self.state.last_refresh >= interval:
+            self.refresh_prs()
+
+    def handle_key(self, key: int) -> None:
+        state = self.state
+        if key in (ord("q"), 27):
+            state.quit = True
+        elif key in (curses.KEY_UP, ord("k")):
+            self.move_selection(-1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.move_selection(1)
+        elif key in (curses.KEY_PPAGE, ord("K")):
+            self.move_selection(-10)
+        elif key in (curses.KEY_NPAGE, ord("J")):
+            self.move_selection(10)
+        elif key == curses.KEY_HOME:
+            self.set_selection(0)
+        elif key == curses.KEY_END:
+            self.set_selection(len(state.filtered_prs) - 1)
+        elif key == ord("\t"):
+            self.cycle_focus()
+        elif key in (ord("r"), curses.KEY_F5):
+            self.refresh_prs()
+        elif key == ord("/"):
+            self.prompt_filter()
+        elif key == ord("o"):
+            self.open_current()
+        elif key in (ord("v"), ord("\n"), curses.KEY_ENTER):
+            self.load_current_detail(force=True)
+            state.focus = "detail"
+        elif key == ord("c"):
+            self.load_current_checks(force=True)
+            state.focus = "checks"
+        elif key == ord("a"):
+            self.approve_current()
+        elif key == ord("e"):
+            self.enable_auto_merge_current()
+        elif key == ord("m"):
+            self.merge_current()
+        elif key == ord("w"):
+            self.open_checks_web()
+        elif key in (ord("g"),):
+            self.set_selection(0)
+        elif key in (ord("G"),):
+            self.set_selection(len(state.filtered_prs) - 1)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            if state.focus == "detail":
+                state.detail_scroll += 1
+            elif state.focus == "checks":
+                state.checks_scroll += 1
+        elif key in (curses.KEY_LEFT, ord("h")):
+            if state.focus == "detail":
+                state.detail_scroll = max(0, state.detail_scroll - 1)
+            elif state.focus == "checks":
+                state.checks_scroll = max(0, state.checks_scroll - 1)
+
+    def cycle_focus(self) -> None:
+        order = ["list", "detail", "checks"]
+        idx = order.index(self.state.focus) if self.state.focus in order else 0
+        self.state.focus = order[(idx + 1) % len(order)]
+        self.state.dirty = True
+
+    def move_selection(self, delta: int) -> None:
+        self.set_selection(self.state.selected + delta)
+
+    def set_selection(self, index: int) -> None:
+        count = len(self.state.filtered_prs)
+        if count == 0:
+            self.state.selected = 0
+        else:
+            self.state.selected = min(max(index, 0), count - 1)
+        self.state.detail_scroll = 0
+        self.state.checks_scroll = 0
+        self.state.dirty = True
+
+    def refresh_prs(self) -> None:
+        state = self.state
+        state.loading = True
+        state.status = "Loading PRs..."
+        state.error = ""
+        self.draw()
+        try:
+            items = gh_json(build_search_command(state.args))
+            existing = {(pr.repo, pr.number): pr for pr in state.prs}
+            prs = []
+            for item in items:
+                pr = PullRequest.from_json(item)
+                if pr.is_draft and not state.args.include_drafts:
+                    continue
+                old = existing.get((pr.repo, pr.number))
+                if old:
+                    pr.detail = old.detail
+                    pr.checks = old.checks
+                    pr.detail_loaded_at = old.detail_loaded_at
+                    pr.checks_loaded_at = old.checks_loaded_at
+                prs.append(pr)
+            state.prs = prs
+            state.selected = min(state.selected, max(len(state.filtered_prs) - 1, 0))
+            state.last_refresh = time.time()
+            state.status = f"Loaded {len(prs)} PRs at {time.strftime('%H:%M:%S')}."
+        except GhError as exc:
+            state.error = exc.message
+            state.status = "Failed to load PRs."
+        finally:
+            state.loading = False
+            state.dirty = True
+
+    def load_current_detail(self, force: bool = False) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        if pr.detail and not force:
+            return
+        self.state.status = f"Loading {pr.repo}#{pr.number} details..."
+        self.draw()
+        try:
+            pr.detail = gh_json(["gh", "pr", "view", str(pr.number), "-R", pr.repo, "--json", VIEW_FIELDS])
+            pr.detail_loaded_at = time.time()
+            self.state.error = ""
+            self.state.status = f"Loaded details for {pr.repo}#{pr.number}."
+        except GhError as exc:
+            self.state.error = exc.message
+            self.state.status = "Failed to load PR details."
+
+    def load_current_checks(self, force: bool = False) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        if pr.checks is not None and not force:
+            return
+        self.state.status = f"Loading checks for {pr.repo}#{pr.number}..."
+        self.draw()
+        try:
+            pr.checks = gh_json(
+                ["gh", "pr", "checks", str(pr.number), "-R", pr.repo, "--json", CHECK_FIELDS],
+                ok_returncodes=(0, 8),
+            )
+            pr.checks_loaded_at = time.time()
+            self.state.error = ""
+            self.state.status = f"Loaded checks for {pr.repo}#{pr.number}."
+        except GhError as exc:
+            self.state.error = exc.message
+            self.state.status = "Failed to load checks."
+
+    def open_current(self) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        self.run_action(["gh", "pr", "view", str(pr.number), "-R", pr.repo, "--web"], f"Opened {pr.repo}#{pr.number}.")
+
+    def open_checks_web(self) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        self.run_action(["gh", "pr", "checks", str(pr.number), "-R", pr.repo, "--web"], "Opened checks in browser.")
+
+    def approve_current(self) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        if not self.confirm(f"Approve {pr.repo}#{pr.number}?"):
+            return
+        self.run_action(
+            ["gh", "pr", "review", str(pr.number), "-R", pr.repo, "--approve"],
+            f"Approved {pr.repo}#{pr.number}.",
+            refresh=True,
+        )
+
+    def merge_current(self) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        choice = self.prompt_choice(
+            f"Merge {pr.repo}#{pr.number}: [s]quash [m]erge [r]ebase [a]uto [Esc] cancel",
+            {"s", "m", "r", "a"},
+        )
+        if not choice:
+            return
+        if choice == "a":
+            command = self.auto_merge_command(pr)
+            if not command:
+                return
+            self.run_action(command, f"Auto-merge enabled for {pr.repo}#{pr.number}.", refresh=True)
+            return
+        flag = {"s": "--squash", "m": "--merge", "r": "--rebase"}[choice]
+        delete_branch = False
+        delete_branch = self.confirm("Delete branch after merge?", default=False)
+        command = ["gh", "pr", "merge", str(pr.number), "-R", pr.repo, flag]
+        if delete_branch:
+            command.append("--delete-branch")
+        self.run_action(command, f"Merge command completed for {pr.repo}#{pr.number}.", refresh=True)
+
+    def enable_auto_merge_current(self) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        if not self.confirm(f"Enable auto-merge for {pr.repo}#{pr.number}?"):
+            return
+        command = self.auto_merge_command(pr)
+        if not command:
+            return
+        self.run_action(command, f"Auto-merge enabled for {pr.repo}#{pr.number}.", refresh=True)
+
+    def auto_merge_command(self, pr: PullRequest) -> list[str] | None:
+        choice = self.prompt_choice(
+            "Auto-merge method: [s]quash [m]erge [r]ebase [d]efault [Esc] cancel",
+            {"s", "m", "r", "d"},
+        )
+        if not choice:
+            return None
+        command = ["gh", "pr", "merge", str(pr.number), "-R", pr.repo, "--auto"]
+        if choice != "d":
+            command.append({"s": "--squash", "m": "--merge", "r": "--rebase"}[choice])
+        return command
+
+    def run_action(self, command: list[str], success: str, refresh: bool = False) -> None:
+        self.state.status = f"Running {shell_join(command)}"
+        self.draw()
+        try:
+            run_gh(command)
+            self.state.error = ""
+            self.state.status = success
+            if refresh:
+                self.refresh_prs()
+        except GhError as exc:
+            self.state.error = exc.message
+            self.state.status = "Command failed."
+
+    def prompt_filter(self) -> None:
+        current = self.state.filter_text
+        value = self.prompt_text("Filter", current)
+        if value is not None:
+            self.state.filter_text = value
+            self.state.selected = 0
+            self.state.offset = 0
+            self.state.status = f"Filter: {value}" if value else "Filter cleared."
+
+    def prompt_text(self, label: str, default: str = "") -> str | None:
+        curses.curs_set(1)
+        try:
+            max_y, max_x = self.stdscr.getmaxyx()
+            prompt = f"{label}: "
+            value = default
+            while True:
+                self.draw_footer(max_y - 1, prompt + value, active=True)
+                key = self.stdscr.getch()
+                if key in (27,):
+                    return None
+                if key in (ord("\n"), curses.KEY_ENTER):
+                    return value
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    value = value[:-1]
+                elif key == curses.KEY_DC:
+                    value = ""
+                elif 32 <= key <= 126 and len(prompt) + len(value) < max_x - 2:
+                    value += chr(key)
+        finally:
+            curses.curs_set(0)
+            self.state.dirty = True
+
+    def confirm(self, prompt: str, default: bool = True) -> bool:
+        suffix = " [Y/n]" if default else " [y/N]"
+        choice = self.prompt_choice(prompt + suffix, {"y", "n", "\n"})
+        if choice == "\n":
+            return default
+        return choice == "y"
+
+    def prompt_choice(self, prompt: str, choices: set[str]) -> str | None:
+        max_y, _ = self.stdscr.getmaxyx()
+        self.draw_footer(max_y - 1, prompt, active=True)
+        while True:
+            key = self.stdscr.getch()
+            if key in (27, ord("q")):
+                self.state.status = "Cancelled."
+                return None
+            if key in (ord("\n"), curses.KEY_ENTER) and "\n" in choices:
+                return "\n"
+            char = chr(key).lower() if 0 <= key < 256 else ""
+            if char in choices:
+                return char
+
+    def draw(self) -> None:
+        max_y, max_x = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        if max_y < 12 or max_x < 60:
+            self.addstr(0, 0, "Terminal too small. Resize to at least 60x12.")
+            self.stdscr.refresh()
+            return
+        self.draw_header(max_x)
+        list_w = max(36, min(64, max_x // 2))
+        right_x = list_w + 1
+        right_w = max_x - right_x
+        content_h = max_y - 4
+        self.draw_list(2, 0, content_h, list_w)
+        self.draw_divider(2, list_w, content_h)
+        self.draw_right(2, right_x, content_h, right_w)
+        self.draw_footer(max_y - 1, self.footer_text())
+        self.stdscr.refresh()
+
+    def draw_header(self, width: int) -> None:
+        args = self.state.args
+        scopes = []
+        if args.owners:
+            scopes.append("owners=" + ",".join(args.owners))
+        if args.repos:
+            scopes.append("repos=" + ",".join(args.repos))
+        if not scopes:
+            scopes.append("all accessible repos")
+        title = f" pr-tui | {args.query} | {'; '.join(scopes)} "
+        self.addstr(0, 0, fit(title, width), self.color("muted") | curses.A_BOLD)
+        count = f"{len(self.state.filtered_prs)}/{len(self.state.prs)} PRs"
+        self.addstr(0, max(0, width - len(count) - 1), count, self.color("muted"))
+        hints = "j/k move  v details  c checks  o open  a approve  e auto  m merge  / filter  r refresh  q quit"
+        self.addstr(1, 0, fit(hints, width), curses.A_DIM)
+
+    def draw_list(self, y: int, x: int, height: int, width: int) -> None:
+        prs = self.state.filtered_prs
+        if not prs:
+            message = "No pull requests match."
+            if self.state.error:
+                message = "No pull requests loaded."
+            self.addstr(y, x, fit(message, width), curses.A_DIM)
+            return
+        self.adjust_offset(height)
+        visible = prs[self.state.offset : self.state.offset + height]
+        for row, pr in enumerate(visible):
+            idx = self.state.offset + row
+            selected = idx == self.state.selected
+            attr = self.color("selected") if selected else 0
+            marker = ">" if selected else " "
+            status = "DRAFT" if pr.is_draft else age(pr.updated_at)
+            line1 = f"{marker} {pr.repo}#{pr.number} {status}"
+            if row < height:
+                self.addstr(y + row, x, fit(compact(line1, width), width), attr | curses.A_BOLD)
+            if width < 48:
+                continue
+            title_attr = attr if selected else curses.A_DIM
+            self.addstr(y + row, x + min(len(line1) + 1, width - 1), "", title_attr)
+            title_start = min(len(line1) + 1, width - 1)
+            available = max(0, width - title_start)
+            if available:
+                self.addstr(y + row, x + title_start, fit(pr.title, available), attr)
+    def draw_divider(self, y: int, x: int, height: int) -> None:
+        for row in range(height):
+            self.addstr(y + row, x, "|", curses.A_DIM)
+
+    def draw_right(self, y: int, x: int, height: int, width: int) -> None:
+        pr = self.state.current
+        if not pr:
+            self.addstr(y, x, "No PR selected.", curses.A_DIM)
+            return
+        tab = f"[{'detail' if self.state.focus == 'detail' else 'DETAIL'}] [{'checks' if self.state.focus == 'checks' else 'CHECKS'}]"
+        self.addstr(y, x, fit(tab, width), self.color("muted") | curses.A_BOLD)
+        if self.state.focus == "checks":
+            if pr.checks is None:
+                self.addstr(y + 2, x, "Press c to load CI checks.", curses.A_DIM)
+            else:
+                self.draw_checks(y + 1, x, height - 1, width, pr)
+        else:
+            if pr.detail is None:
+                self.draw_summary(y + 1, x, height - 1, width, pr)
+            else:
+                self.draw_detail(y + 1, x, height - 1, width, pr)
+
+    def draw_summary(self, y: int, x: int, height: int, width: int, pr: PullRequest) -> None:
+        lines = [
+            f"{pr.repo}#{pr.number}",
+            pr.title,
+            "",
+            f"Author: {pr.author or '-'}",
+            f"Updated: {format_date(pr.updated_at)}",
+            f"Created: {format_date(pr.created_at)}",
+            f"Comments: {pr.comments_count}",
+            f"Labels: {', '.join(pr.labels) if pr.labels else '-'}",
+            f"Assignees: {', '.join(pr.assignees) if pr.assignees else '-'}",
+            "",
+            "Press v/Enter for full details or c for latest CI.",
+        ]
+        self.draw_lines(y, x, height, width, lines, 0)
+
+    def draw_detail(self, y: int, x: int, height: int, width: int, pr: PullRequest) -> None:
+        detail = pr.detail or {}
+        review_requests = users_from_review_requests(detail.get("reviewRequests") or [])
+        latest_reviews = latest_reviews(detail.get("latestReviews") or [])
+        checks = summarize_status_rollup(detail.get("statusCheckRollup") or [])
+        files = detail.get("files") or []
+        commits = detail.get("commits") or []
+        body = detail.get("body") or ""
+        lines = [
+            f"{pr.repo}#{pr.number}: {detail.get('title') or pr.title}",
+            f"URL: {pr.url}",
+            "",
+            f"Author: {login(detail.get('author')) or pr.author or '-'}",
+            f"Branch: {detail.get('headRefName') or '-'} -> {detail.get('baseRefName') or '-'}",
+            f"Review decision: {detail.get('reviewDecision') or '-'}",
+            f"Merge state: {detail.get('mergeStateStatus') or '-'} / mergeable={detail.get('mergeable') or '-'}",
+            f"Requested reviewers: {', '.join(review_requests) if review_requests else '-'}",
+            f"Latest reviews: {', '.join(latest_reviews) if latest_reviews else '-'}",
+            f"Checks: {checks}",
+            f"Changes: +{detail.get('additions', 0)} -{detail.get('deletions', 0)} across {detail.get('changedFiles', 0)} files",
+            f"Commits: {len(commits)}",
+            "",
+            "Files:",
+        ]
+        lines.extend(f"  {file_item.get('path', '-')}" for file_item in files[:25])
+        if len(files) > 25:
+            lines.append(f"  ... {len(files) - 25} more")
+        if body:
+            lines.extend(["", "Body:"])
+            lines.extend(wrap_lines(body, width))
+        self.draw_lines(y, x, height, width, lines, self.state.detail_scroll)
+
+    def draw_checks(self, y: int, x: int, height: int, width: int, pr: PullRequest) -> None:
+        checks = pr.checks or []
+        if not checks:
+            self.addstr(y, x, "No checks returned by gh.", curses.A_DIM)
+            return
+        lines = []
+        counts: dict[str, int] = {}
+        for check in checks:
+            bucket = check.get("bucket") or check.get("state") or "unknown"
+            counts[bucket] = counts.get(bucket, 0) + 1
+        summary = "  ".join(f"{name}:{count}" for name, count in sorted(counts.items()))
+        lines.append(f"Checks for {pr.repo}#{pr.number} ({summary})")
+        if pr.checks_loaded_at:
+            lines.append(f"Loaded: {time.strftime('%H:%M:%S', time.localtime(pr.checks_loaded_at))}")
+        lines.append("")
+        for check in checks:
+            bucket = check.get("bucket") or "-"
+            name = check.get("name") or "-"
+            state = check.get("state") or "-"
+            workflow = check.get("workflow") or "-"
+            completed = format_date(check.get("completedAt") or "")
+            description = check.get("description") or ""
+            lines.append(f"{bucket.upper():8} {name}")
+            lines.append(f"         state={state} workflow={workflow} completed={completed}")
+            if description:
+                lines.extend("         " + line for line in wrap_lines(description, max(10, width - 9)))
+        self.draw_lines(y, x, height, width, lines, self.state.checks_scroll)
+
+    def draw_lines(self, y: int, x: int, height: int, width: int, lines: list[str], scroll: int) -> None:
+        for row, line in enumerate(lines[scroll : scroll + height]):
+            attr = attr_for_line(line, self)
+            self.addstr(y + row, x, fit(line, width), attr)
+
+    def draw_footer(self, y: int, text: str, active: bool = False) -> None:
+        _, max_x = self.stdscr.getmaxyx()
+        attr = self.color("selected") if active else curses.A_REVERSE
+        self.addstr(y, 0, fit(text, max_x), attr)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+
+    def footer_text(self) -> str:
+        state = self.state
+        parts = []
+        if state.status:
+            parts.append(state.status)
+        if state.filter_text:
+            parts.append(f"filter={state.filter_text}")
+        if state.error:
+            first = state.error.splitlines()[0]
+            parts.append(f"ERROR: {first}")
+        return " | ".join(parts) or "Ready."
+
+    def adjust_offset(self, height: int) -> None:
+        state = self.state
+        if state.selected < state.offset:
+            state.offset = state.selected
+        if state.selected >= state.offset + height:
+            state.offset = state.selected - height + 1
+        state.offset = max(0, min(state.offset, max(0, len(state.filtered_prs) - height)))
+
+    def addstr(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        max_y, max_x = self.stdscr.getmaxyx()
+        if y < 0 or y >= max_y or x < 0 or x >= max_x:
+            return
+        safe = text[: max(0, max_x - x - 1)]
+        try:
+            self.stdscr.addstr(y, x, safe, attr)
+        except curses.error:
+            pass
+
+
+def build_search_command(args: Args) -> list[str]:
+    command = [
+        "gh",
+        "search",
+        "prs",
+        "--state",
+        args.state,
+        "--limit",
+        str(args.limit),
+        "--json",
+        SEARCH_FIELDS,
+    ]
+    for owner in args.owners:
+        command.extend(["--owner", owner])
+    for repo in args.repos:
+        command.extend(["--repo", repo])
+    query = shlex.split(args.query)
+    if query:
+        command.extend(["--", *query])
+    return command
+
+
+def gh_json(command: list[str], ok_returncodes: tuple[int, ...] = (0,)) -> Any:
+    result = run_gh(command, ok_returncodes=ok_returncodes)
+    if not result.stdout.strip():
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise GhError(command, f"invalid JSON from gh: {exc}", result.stdout, result.returncode) from exc
+
+
+def run_gh(command: list[str], ok_returncodes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.setdefault("GH_PROMPT_DISABLED", "1")
+    result = subprocess.run(command, text=True, capture_output=True, env=env, check=False)
+    if result.returncode not in ok_returncodes:
+        raise GhError(command, result.stderr, result.stdout, result.returncode)
+    return result
+
+
+def self_update(repo: str | None, target: str | None) -> int:
+    release_repo = repo or os.environ.get("PR_TUI_UPDATE_REPO") or DEFAULT_UPDATE_REPO
+    if not release_repo:
+        print(
+            "No update repository configured. Use --update-repo OWNER/REPO or set "
+            "PR_TUI_UPDATE_REPO=OWNER/REPO.",
+            file=sys.stderr,
+        )
+        return 2
+    destination = pathlib.Path(target or sys.argv[0]).expanduser().resolve()
+    if not destination.exists():
+        print(f"Update target does not exist: {destination}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="pr-tui-update-") as tmp:
+        downloaded = pathlib.Path(tmp) / RELEASE_ASSET
+        command = [
+            "gh",
+            "release",
+            "download",
+            "--repo",
+            release_repo,
+            "--pattern",
+            RELEASE_ASSET,
+            "--output",
+            str(downloaded),
+            "--clobber",
+        ]
+        try:
+            run_gh(command)
+        except GhError as exc:
+            print(exc.message, file=sys.stderr)
+            return exc.returncode
+        downloaded.chmod(0o755)
+        if same_file_bytes(downloaded, destination):
+            print(f"pr-tui is already current at {destination}")
+            return 0
+        try:
+            install_executable(downloaded, destination)
+        except GhError as exc:
+            print(exc.message, file=sys.stderr)
+            return exc.returncode
+        except OSError as exc:
+            print(f"failed to install {destination}: {exc}", file=sys.stderr)
+            return 1
+    print(f"Updated pr-tui from {release_repo} to {destination}")
+    return 0
+
+
+def same_file_bytes(left: pathlib.Path, right: pathlib.Path) -> bool:
+    try:
+        return left.read_bytes() == right.read_bytes()
+    except OSError:
+        return False
+
+
+def install_executable(source: pathlib.Path, destination: pathlib.Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if os.access(destination, os.W_OK) or not destination.exists() and os.access(destination.parent, os.W_OK):
+        shutil.copy2(source, destination)
+        destination.chmod(0o755)
+        return
+    run_interactive(["sudo", "install", "-m", "0755", str(source), str(destination)])
+
+
+def run_interactive(command: list[str]) -> None:
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise GhError(command, "", "", result.returncode)
+
+
+def shell_join(command: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def fit(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    text = text.replace("\t", "  ").replace("\n", " ")
+    if len(text) <= width:
+        return text.ljust(width)
+    if width <= 3:
+        return "." * width
+    return text[: width - 3] + "..."
+
+
+def compact(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return "." * max(0, width)
+    return text[: width - 3] + "..."
+
+
+def login(value: Any) -> str:
+    if isinstance(value, dict):
+        return value.get("login") or value.get("name") or ""
+    return ""
+
+
+def repo_name_from_url(url: str) -> str:
+    parts = url.rstrip("/").split("/")
+    if len(parts) >= 5:
+        return f"{parts[-4]}/{parts[-3]}"
+    return ""
+
+
+def users_from_review_requests(items: list[dict[str, Any]]) -> list[str]:
+    users = []
+    for item in items:
+        requested = item.get("requestedReviewer") or item.get("requestedTeam") or item
+        name = login(requested) or requested.get("slug") or requested.get("name") or ""
+        if name:
+            users.append(name)
+    return users
+
+
+def latest_reviews(items: list[dict[str, Any]]) -> list[str]:
+    reviews = []
+    for item in items:
+        author = login(item.get("author")) or "-"
+        state = item.get("state") or "-"
+        reviews.append(f"{author}:{state}")
+    return reviews
+
+
+def summarize_status_rollup(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "-"
+    counts: dict[str, int] = {}
+    for item in items:
+        conclusion = item.get("conclusion") or item.get("status") or item.get("state") or "unknown"
+        counts[conclusion] = counts.get(conclusion, 0) + 1
+    return ", ".join(f"{key}:{value}" for key, value in sorted(counts.items()))
+
+
+def format_date(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    local = parsed.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M")
+
+
+def age(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return "-"
+    now = datetime.now(timezone.utc)
+    delta = now - parsed.astimezone(timezone.utc)
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def wrap_lines(text: str, width: int) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        if not raw:
+            lines.append("")
+            continue
+        lines.extend(textwrap.wrap(raw, width=max(20, width), replace_whitespace=False) or [""])
+    return lines
+
+
+def attr_for_line(line: str, app: App) -> int:
+    head = line.strip().split(" ", 1)[0].upper()
+    if head in {"PASS", "SUCCESS"} or "APPROVED" in line:
+        return app.color("ok")
+    if head in {"FAIL", "FAILURE", "ERROR"} or "CHANGES_REQUESTED" in line:
+        return app.color("bad")
+    if head in {"PENDING", "SKIPPING", "CANCEL"}:
+        return app.color("warn")
+    if line.endswith(":"):
+        return app.color("muted") | curses.A_BOLD
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

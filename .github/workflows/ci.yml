@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show tool versions
+        run: |
+          python3 --version
+          gh --version
+
+      - name: Compile Python
+        run: python3 -m py_compile pr-tui
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Check CLI help
+        run: ./pr-tui --help
+
+      - name: Smoke test curses startup
+        run: python3 tests/smoke_curses.py
+
+      - name: Check installer syntax
+        run: sh -n install.sh
