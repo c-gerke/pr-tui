@@ -200,7 +200,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--update-repo",
-        help="Repository to update from, in OWNER/REPO form. Defaults to PR_TUI_UPDATE_REPO.",
+        help=(
+            "Repository to update from, in OWNER/REPO form. Defaults to "
+            "PR_TUI_UPDATE_REPO or c-gerke/pr-tui."
+        ),
     )
     parser.add_argument(
         "--update-target",
