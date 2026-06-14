@@ -101,6 +101,10 @@ class PullRequest:
         )
 
 
+def pr_key(pr: PullRequest) -> tuple[str, int]:
+    return (pr.repo, pr.number)
+
+
 @dataclass
 class State:
     args: Args
@@ -108,6 +112,7 @@ class State:
     selected: int = 0
     offset: int = 0
     filter_text: str = ""
+    marked: set[tuple[str, int]] = field(default_factory=set)
     detail_scroll: int = 0
     checks_scroll: int = 0
     focus: str = "list"
@@ -117,6 +122,29 @@ class State:
     last_refresh: float = 0
     dirty: bool = True
     quit: bool = False
+
+    def is_marked(self, pr: PullRequest) -> bool:
+        return pr_key(pr) in self.marked
+
+    def marked_prs(self) -> list[PullRequest]:
+        return [pr for pr in self.filtered_prs if self.is_marked(pr)]
+
+    def prune_marks(self) -> None:
+        loaded = {pr_key(pr) for pr in self.prs}
+        self.marked &= loaded
+
+    def toggle_mark(self, pr: PullRequest) -> None:
+        key = pr_key(pr)
+        if key in self.marked:
+            self.marked.discard(key)
+        else:
+            self.marked.add(key)
+
+    def mark_all_filtered(self) -> None:
+        self.marked.update(pr_key(pr) for pr in self.filtered_prs)
+
+    def clear_marks(self) -> None:
+        self.marked.clear()
 
     @property
     def filtered_prs(self) -> list[PullRequest]:
@@ -140,6 +168,14 @@ class State:
             return None
         self.selected = min(max(self.selected, 0), len(prs) - 1)
         return prs[self.selected]
+
+
+def resolve_action_targets(state: State) -> list[PullRequest]:
+    marked = state.marked_prs()
+    if marked:
+        return marked
+    current = state.current
+    return [current] if current else []
 
 
 def main() -> int:
@@ -286,6 +322,12 @@ class App:
             self.refresh_prs()
         elif key == ord("/"):
             self.prompt_filter()
+        elif key == ord(" ") and state.focus == "list":
+            self.toggle_mark_current()
+        elif key == ord("*"):
+            self.mark_all()
+        elif key == ord("u"):
+            self.clear_marks()
         elif key == ord("o"):
             self.open_current()
         elif key in (ord("v"), ord("\n"), curses.KEY_ENTER):
@@ -336,6 +378,38 @@ class App:
         self.state.checks_scroll = 0
         self.state.dirty = True
 
+    def toggle_mark_current(self) -> None:
+        pr = self.state.current
+        if not pr:
+            return
+        self.state.toggle_mark(pr)
+        self.state.dirty = True
+
+    def mark_all(self) -> None:
+        self.state.mark_all_filtered()
+        count = len(self.state.marked_prs())
+        self.state.status = f"Marked {count} PRs."
+        self.state.dirty = True
+
+    def clear_marks(self) -> None:
+        if not self.state.marked:
+            return
+        self.state.clear_marks()
+        self.state.status = "Marks cleared."
+        self.state.dirty = True
+
+    def resolve_action_targets(self) -> list[PullRequest]:
+        return resolve_action_targets(self.state)
+
+    def batch_label(self, prs: list[PullRequest]) -> str:
+        if len(prs) == 1:
+            pr = prs[0]
+            return f"{pr.repo}#{pr.number}"
+        preview = ", ".join(f"{pr.repo}#{pr.number}" for pr in prs[:5])
+        if len(prs) > 5:
+            preview += f", +{len(prs) - 5} more"
+        return f"{len(prs)} PRs ({preview})"
+
     def refresh_prs(self) -> None:
         state = self.state
         state.loading = True
@@ -358,6 +432,7 @@ class App:
                     pr.checks_loaded_at = old.checks_loaded_at
                 prs.append(pr)
             state.prs = prs
+            state.prune_marks()
             state.selected = min(state.selected, max(len(state.filtered_prs) - 1, 0))
             state.last_refresh = time.time()
             state.status = f"Loaded {len(prs)} PRs at {time.strftime('%H:%M:%S')}."
@@ -406,75 +481,150 @@ class App:
             self.state.status = "Failed to load checks."
 
     def open_current(self) -> None:
-        pr = self.state.current
-        if not pr:
+        prs = self.resolve_action_targets()
+        if not prs:
+            self.state.status = "No PR selected."
             return
-        self.run_action(["gh", "pr", "view", str(pr.number), "-R", pr.repo, "--web"], f"Opened {pr.repo}#{pr.number}.")
+        label = self.batch_label(prs)
+        if len(prs) > 1 and not self.confirm(f"Open {label} in browser?"):
+            return
+        self.run_batch_action(
+            prs,
+            lambda pr: ["gh", "pr", "view", str(pr.number), "-R", pr.repo, "--web"],
+            "Opened",
+        )
 
     def open_checks_web(self) -> None:
-        pr = self.state.current
-        if not pr:
+        prs = self.resolve_action_targets()
+        if not prs:
+            self.state.status = "No PR selected."
             return
-        self.run_action(["gh", "pr", "checks", str(pr.number), "-R", pr.repo, "--web"], "Opened checks in browser.")
+        label = self.batch_label(prs)
+        if len(prs) > 1 and not self.confirm(f"Open checks for {label} in browser?"):
+            return
+        self.run_batch_action(
+            prs,
+            lambda pr: ["gh", "pr", "checks", str(pr.number), "-R", pr.repo, "--web"],
+            "Opened checks for",
+        )
 
     def approve_current(self) -> None:
-        pr = self.state.current
-        if not pr:
+        prs = self.resolve_action_targets()
+        if not prs:
+            self.state.status = "No PR selected."
             return
-        if not self.confirm(f"Approve {pr.repo}#{pr.number}?"):
+        if not self.confirm(f"Approve {self.batch_label(prs)}?"):
             return
-        self.run_action(
-            ["gh", "pr", "review", str(pr.number), "-R", pr.repo, "--approve"],
-            f"Approved {pr.repo}#{pr.number}.",
+        self.run_batch_action(
+            prs,
+            lambda pr: ["gh", "pr", "review", str(pr.number), "-R", pr.repo, "--approve"],
+            "Approved",
             refresh=True,
         )
 
     def merge_current(self) -> None:
-        pr = self.state.current
-        if not pr:
+        prs = self.resolve_action_targets()
+        if not prs:
+            self.state.status = "No PR selected."
             return
+        label = self.batch_label(prs)
         choice = self.prompt_choice(
-            f"Merge {pr.repo}#{pr.number}: [s]quash [m]erge [r]ebase [a]uto [Esc] cancel",
+            f"Merge {label}: [s]quash [m]erge [r]ebase [a]uto [Esc] cancel",
             {"s", "m", "r", "a"},
         )
         if not choice:
             return
         if choice == "a":
-            command = self.auto_merge_command(pr)
-            if not command:
+            method = self.prompt_auto_merge_method()
+            if not method:
                 return
-            self.run_action(command, f"Auto-merge enabled for {pr.repo}#{pr.number}.", refresh=True)
+            self.run_batch_action(
+                prs,
+                lambda pr: self.build_auto_merge_command(pr, method),
+                "Auto-merge enabled for",
+                refresh=True,
+            )
             return
         flag = {"s": "--squash", "m": "--merge", "r": "--rebase"}[choice]
-        delete_branch = False
         delete_branch = self.confirm("Delete branch after merge?", default=False)
-        command = ["gh", "pr", "merge", str(pr.number), "-R", pr.repo, flag]
-        if delete_branch:
-            command.append("--delete-branch")
-        self.run_action(command, f"Merge command completed for {pr.repo}#{pr.number}.", refresh=True)
+
+        def build_merge_command(pr: PullRequest) -> list[str]:
+            command = ["gh", "pr", "merge", str(pr.number), "-R", pr.repo, flag]
+            if delete_branch:
+                command.append("--delete-branch")
+            return command
+
+        self.run_batch_action(prs, build_merge_command, "Merged", refresh=True)
 
     def enable_auto_merge_current(self) -> None:
-        pr = self.state.current
-        if not pr:
+        prs = self.resolve_action_targets()
+        if not prs:
+            self.state.status = "No PR selected."
             return
-        if not self.confirm(f"Enable auto-merge for {pr.repo}#{pr.number}?"):
+        if not self.confirm(f"Enable auto-merge for {self.batch_label(prs)}?"):
             return
-        command = self.auto_merge_command(pr)
-        if not command:
+        method = self.prompt_auto_merge_method()
+        if not method:
             return
-        self.run_action(command, f"Auto-merge enabled for {pr.repo}#{pr.number}.", refresh=True)
+        self.run_batch_action(
+            prs,
+            lambda pr: self.build_auto_merge_command(pr, method),
+            "Auto-merge enabled for",
+            refresh=True,
+        )
 
-    def auto_merge_command(self, pr: PullRequest) -> list[str] | None:
-        choice = self.prompt_choice(
+    def prompt_auto_merge_method(self) -> str | None:
+        return self.prompt_choice(
             "Auto-merge method: [s]quash [m]erge [r]ebase [d]efault [Esc] cancel",
             {"s", "m", "r", "d"},
         )
-        if not choice:
-            return None
+
+    def build_auto_merge_command(self, pr: PullRequest, method: str) -> list[str]:
         command = ["gh", "pr", "merge", str(pr.number), "-R", pr.repo, "--auto"]
-        if choice != "d":
-            command.append({"s": "--squash", "m": "--merge", "r": "--rebase"}[choice])
+        if method != "d":
+            command.append({"s": "--squash", "m": "--merge", "r": "--rebase"}[method])
         return command
+
+    def auto_merge_command(self, pr: PullRequest) -> list[str] | None:
+        method = self.prompt_auto_merge_method()
+        if not method:
+            return None
+        return self.build_auto_merge_command(pr, method)
+
+    def run_batch_action(
+        self,
+        prs: list[PullRequest],
+        build_command,
+        verb: str,
+        refresh: bool = False,
+    ) -> None:
+        if len(prs) == 1:
+            pr = prs[0]
+            command = build_command(pr)
+            self.run_action(command, f"{verb} {pr.repo}#{pr.number}.", refresh=refresh)
+            return
+        successes: list[str] = []
+        failures: list[str] = []
+        total = len(prs)
+        last_error = ""
+        for index, pr in enumerate(prs):
+            self.state.status = f"{verb} {pr.repo}#{pr.number} ({index + 1}/{total})..."
+            self.draw()
+            try:
+                run_gh(build_command(pr))
+                successes.append(f"{pr.repo}#{pr.number}")
+            except GhError as exc:
+                failures.append(f"{pr.repo}#{pr.number}")
+                last_error = exc.message
+        if failures:
+            failed = ", ".join(failures)
+            self.state.status = f"{verb} {len(successes)}/{total} PRs (failed: {failed})."
+            self.state.error = last_error
+        else:
+            self.state.error = ""
+            self.state.status = f"{verb} {len(successes)}/{total} PRs."
+        if refresh:
+            self.refresh_prs()
 
     def run_action(self, command: list[str], success: str, refresh: bool = False) -> None:
         self.state.status = f"Running {shell_join(command)}"
@@ -496,6 +646,7 @@ class App:
             self.state.filter_text = value
             self.state.selected = 0
             self.state.offset = 0
+            self.state.prune_marks()
             self.state.status = f"Filter: {value}" if value else "Filter cleared."
 
     def prompt_text(self, label: str, default: str = "") -> str | None:
@@ -572,9 +723,20 @@ class App:
         title = f" pr-tui | {args.query} | {'; '.join(scopes)} "
         self.addstr(0, 0, fit(title, width), self.color("muted") | curses.A_BOLD)
         count = f"{len(self.state.filtered_prs)}/{len(self.state.prs)} PRs"
+        if self.state.marked:
+            count += f" | {len(self.state.marked)} marked"
         self.addstr(0, max(0, width - len(count) - 1), count, self.color("muted"))
-        hints = "j/k move  v details  c checks  o open  a approve  e auto  m merge  / filter  r refresh  q quit"
+        hints = "j/k move  Space mark  * all  u clear  v details  c checks  o open  a approve  e auto  m merge  / filter  r refresh  q quit"
         self.addstr(1, 0, fit(hints, width), curses.A_DIM)
+
+    def list_marker(self, cursor: bool, marked: bool) -> str:
+        if cursor and marked:
+            return ">*"
+        if cursor:
+            return "> "
+        if marked:
+            return "* "
+        return "  "
 
     def draw_list(self, y: int, x: int, height: int, width: int) -> None:
         prs = self.state.filtered_prs
@@ -588,21 +750,25 @@ class App:
         visible = prs[self.state.offset : self.state.offset + height]
         for row, pr in enumerate(visible):
             idx = self.state.offset + row
-            selected = idx == self.state.selected
-            attr = self.color("selected") if selected else 0
-            marker = ">" if selected else " "
+            cursor = idx == self.state.selected
+            marked = self.state.is_marked(pr)
+            attr = self.color("selected") if cursor else 0
+            if marked and not cursor:
+                attr = self.color("dim")
+            marker = self.list_marker(cursor, marked)
             status = "DRAFT" if pr.is_draft else age(pr.updated_at)
-            line1 = f"{marker} {pr.repo}#{pr.number} {status}"
+            line1 = f"{marker}{pr.repo}#{pr.number} {status}"
             if row < height:
                 self.addstr(y + row, x, fit(compact(line1, width), width), attr | curses.A_BOLD)
             if width < 48:
                 continue
-            title_attr = attr if selected else curses.A_DIM
+            title_attr = attr if cursor else curses.A_DIM
             self.addstr(y + row, x + min(len(line1) + 1, width - 1), "", title_attr)
             title_start = min(len(line1) + 1, width - 1)
             available = max(0, width - title_start)
             if available:
                 self.addstr(y + row, x + title_start, fit(pr.title, available), attr)
+
     def draw_divider(self, y: int, x: int, height: int) -> None:
         for row in range(height):
             self.addstr(y + row, x, "|", curses.A_DIM)
@@ -720,6 +886,8 @@ class App:
             parts.append(state.status)
         if state.filter_text:
             parts.append(f"filter={state.filter_text}")
+        if state.marked:
+            parts.append(f"{len(state.marked)} marked")
         if state.error:
             first = state.error.splitlines()[0]
             parts.append(f"ERROR: {first}")

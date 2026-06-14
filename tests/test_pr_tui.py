@@ -109,6 +109,82 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(pr_tui.compact("abcdef", 2), "..")
 
 
+class MarkedPrTests(unittest.TestCase):
+    def _make_state(self, prs: list[pr_tui.PullRequest], filter_text: str = "") -> pr_tui.State:
+        args = pr_tui.Args(
+            owners=[],
+            repos=[],
+            query="review-requested:@me",
+            limit=50,
+            state="open",
+            refresh_seconds=0,
+            include_drafts=False,
+        )
+        state = pr_tui.State(args=args, prs=prs, filter_text=filter_text)
+        return state
+
+    def _pr(self, repo: str, number: int, title: str = "title") -> pr_tui.PullRequest:
+        return pr_tui.PullRequest(
+            number=number,
+            repo=repo,
+            title=title,
+            url=f"https://github.com/{repo}/pull/{number}",
+            state="open",
+            is_draft=False,
+            author="mona",
+            updated_at="2026-04-26T20:00:00Z",
+            created_at="2026-04-25T20:00:00Z",
+            comments_count=0,
+        )
+
+    def test_toggle_mark_adds_and_removes_key(self):
+        pr = self._pr("octo/a", 1)
+        state = self._make_state([pr])
+
+        state.toggle_mark(pr)
+        self.assertEqual(state.marked, {("octo/a", 1)})
+
+        state.toggle_mark(pr)
+        self.assertEqual(state.marked, set())
+
+    def test_marked_prs_preserves_filtered_order(self):
+        prs = [self._pr("octo/a", 1), self._pr("octo/b", 2), self._pr("octo/c", 3)]
+        state = self._make_state(prs)
+        state.toggle_mark(prs[2])
+        state.toggle_mark(prs[0])
+
+        self.assertEqual(pr_tui.pr_key(prs[0]), ("octo/a", 1))
+        self.assertEqual(state.marked_prs(), [prs[0], prs[2]])
+
+    def test_prune_marks_removes_stale_keys(self):
+        prs = [self._pr("octo/a", 1), self._pr("octo/b", 2)]
+        state = self._make_state(prs)
+        state.marked = {("octo/a", 1), ("octo/b", 2), ("octo/gone", 99)}
+
+        state.prune_marks()
+
+        self.assertEqual(state.marked, {("octo/a", 1), ("octo/b", 2)})
+
+    def test_resolve_action_targets_prefers_marked_prs(self):
+        prs = [self._pr("octo/a", 1), self._pr("octo/b", 2)]
+        state = self._make_state(prs)
+        state.selected = 0
+        state.toggle_mark(prs[1])
+
+        targets = pr_tui.resolve_action_targets(state)
+
+        self.assertEqual(targets, [prs[1]])
+
+    def test_resolve_action_targets_falls_back_to_current(self):
+        prs = [self._pr("octo/a", 1), self._pr("octo/b", 2)]
+        state = self._make_state(prs)
+        state.selected = 1
+
+        targets = pr_tui.resolve_action_targets(state)
+
+        self.assertEqual(targets, [prs[1]])
+
+
 class SelfUpdateTests(unittest.TestCase):
     def test_default_update_repo_is_configured(self):
         self.assertEqual(pr_tui.DEFAULT_UPDATE_REPO, "c-gerke/pr-tui")

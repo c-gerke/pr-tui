@@ -90,17 +90,23 @@ Use a different GitHub search query when you want a broader queue:
 | `j` / `k` | Move selection |
 | `J` / `K` | Page selection |
 | `g` / `G` | Jump to top/bottom |
+| `Space` | Toggle mark on the selected PR (list focus) |
+| `*` | Mark all PRs in the filtered list |
+| `u` | Clear all marks |
 | `v` / `Enter` | Load PR details |
 | `c` | Load latest CI checks |
 | `w` | Open CI checks in browser |
 | `o` | Open PR in browser |
-| `a` | Approve selected PR |
-| `e` | Enable auto-merge for selected PR, with merge method prompt |
-| `m` | Merge selected PR: squash, merge commit, rebase, or auto |
+| `a` | Approve selected or marked PRs |
+| `e` | Enable auto-merge for selected or marked PRs, with merge method prompt |
+| `m` | Merge selected or marked PRs: squash, merge commit, rebase, or auto |
 | `/` | Filter the loaded PR list locally |
 | `r` / `F5` | Refresh PRs |
 | `Tab` | Cycle the focused pane |
 | `q` / `Esc` | Quit |
+
+When one or more PRs are marked, `a`, `e`, `m`, `o`, and `w` apply to all marked
+PRs. With no marks, those actions apply to the cursor PR only.
 
 ## Useful Options
 
