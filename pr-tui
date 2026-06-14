@@ -105,6 +105,35 @@ def pr_key(pr: PullRequest) -> tuple[str, int]:
     return (pr.repo, pr.number)
 
 
+def repo_owner(pr: PullRequest) -> str:
+    return pr.repo.split("/", 1)[0]
+
+
+def filter_prs(
+    prs: list[PullRequest],
+    *,
+    filter_owner: str = "",
+    filter_repo: str = "",
+    filter_text: str = "",
+) -> list[PullRequest]:
+    if filter_owner:
+        prs = [pr for pr in prs if repo_owner(pr) == filter_owner]
+    if filter_repo:
+        prs = [pr for pr in prs if pr.repo == filter_repo]
+    if not filter_text:
+        return prs
+    needle = filter_text.lower()
+    return [
+        pr
+        for pr in prs
+        if needle in pr.title.lower()
+        or needle in pr.repo.lower()
+        or needle in pr.author.lower()
+        or needle in str(pr.number)
+        or any(needle in label.lower() for label in pr.labels)
+    ]
+
+
 @dataclass
 class State:
     args: Args
@@ -112,6 +141,8 @@ class State:
     selected: int = 0
     offset: int = 0
     filter_text: str = ""
+    filter_owner: str = ""
+    filter_repo: str = ""
     marked: set[tuple[str, int]] = field(default_factory=set)
     detail_scroll: int = 0
     checks_scroll: int = 0
@@ -148,18 +179,12 @@ class State:
 
     @property
     def filtered_prs(self) -> list[PullRequest]:
-        if not self.filter_text:
-            return self.prs
-        needle = self.filter_text.lower()
-        return [
-            pr
-            for pr in self.prs
-            if needle in pr.title.lower()
-            or needle in pr.repo.lower()
-            or needle in pr.author.lower()
-            or needle in str(pr.number)
-            or any(needle in label.lower() for label in pr.labels)
-        ]
+        return filter_prs(
+            self.prs,
+            filter_owner=self.filter_owner,
+            filter_repo=self.filter_repo,
+            filter_text=self.filter_text,
+        )
 
     @property
     def current(self) -> PullRequest | None:
@@ -322,6 +347,12 @@ class App:
             self.refresh_prs()
         elif key == ord("/"):
             self.prompt_filter()
+        elif key == ord("@"):
+            self.filter_by_owner()
+        elif key == ord("#"):
+            self.filter_by_repo()
+        elif key == ord("U"):
+            self.clear_scope_filters()
         elif key == ord(" ") and state.focus == "list":
             self.toggle_mark_current()
         elif key == ord("*"):
@@ -644,10 +675,50 @@ class App:
         value = self.prompt_text("Filter", current)
         if value is not None:
             self.state.filter_text = value
-            self.state.selected = 0
-            self.state.offset = 0
-            self.state.prune_marks()
-            self.state.status = f"Filter: {value}" if value else "Filter cleared."
+            self.apply_filter_change(
+                f"Filter: {value}" if value else "Filter cleared.",
+            )
+
+    def filter_by_owner(self) -> None:
+        pr = self.state.current
+        if not pr:
+            self.state.status = "No PR selected."
+            return
+        owner = repo_owner(pr)
+        if self.state.filter_owner == owner:
+            self.state.filter_owner = ""
+            self.apply_filter_change("Owner filter cleared.")
+            return
+        self.state.filter_owner = owner
+        self.state.filter_repo = ""
+        self.apply_filter_change(f"Owner filter: {owner}")
+
+    def filter_by_repo(self) -> None:
+        pr = self.state.current
+        if not pr:
+            self.state.status = "No PR selected."
+            return
+        if self.state.filter_repo == pr.repo:
+            self.state.filter_repo = ""
+            self.apply_filter_change("Repo filter cleared.")
+            return
+        self.state.filter_repo = pr.repo
+        self.state.filter_owner = ""
+        self.apply_filter_change(f"Repo filter: {pr.repo}")
+
+    def clear_scope_filters(self) -> None:
+        if not self.state.filter_owner and not self.state.filter_repo:
+            return
+        self.state.filter_owner = ""
+        self.state.filter_repo = ""
+        self.apply_filter_change("Scope filters cleared.")
+
+    def apply_filter_change(self, status: str) -> None:
+        self.state.selected = 0
+        self.state.offset = 0
+        self.state.prune_marks()
+        self.state.status = status
+        self.state.dirty = True
 
     def prompt_text(self, label: str, default: str = "") -> str | None:
         curses.curs_set(1)
@@ -726,7 +797,7 @@ class App:
         if self.state.marked:
             count += f" | {len(self.state.marked)} marked"
         self.addstr(0, max(0, width - len(count) - 1), count, self.color("muted"))
-        hints = "j/k move  Space mark  * all  u clear  v details  c checks  o open  a approve  e auto  m merge  / filter  r refresh  q quit"
+        hints = "j/k move  @ owner  # repo  / filter  U clear scope  Space mark  v details  a approve  m merge  q quit"
         self.addstr(1, 0, fit(hints, width), curses.A_DIM)
 
     def list_marker(self, cursor: bool, marked: bool) -> str:
@@ -886,6 +957,10 @@ class App:
             parts.append(state.status)
         if state.filter_text:
             parts.append(f"filter={state.filter_text}")
+        if state.filter_owner:
+            parts.append(f"owner={state.filter_owner}")
+        if state.filter_repo:
+            parts.append(f"repo={state.filter_repo}")
         if state.marked:
             parts.append(f"{len(state.marked)} marked")
         if state.error:

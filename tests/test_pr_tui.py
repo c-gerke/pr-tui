@@ -185,6 +185,53 @@ class MarkedPrTests(unittest.TestCase):
         self.assertEqual(targets, [prs[1]])
 
 
+class ScopeFilterTests(unittest.TestCase):
+    def _pr(self, repo: str, number: int) -> pr_tui.PullRequest:
+        return pr_tui.PullRequest(
+            number=number,
+            repo=repo,
+            title="title",
+            url=f"https://github.com/{repo}/pull/{number}",
+            state="open",
+            is_draft=False,
+            author="mona",
+            updated_at="2026-04-26T20:00:00Z",
+            created_at="2026-04-25T20:00:00Z",
+            comments_count=0,
+        )
+
+    def test_repo_owner_returns_first_path_segment(self):
+        pr = self._pr("octo-corp/example", 1)
+        self.assertEqual(pr_tui.repo_owner(pr), "octo-corp")
+
+    def test_filter_prs_by_owner(self):
+        prs = [
+            self._pr("octo/a", 1),
+            self._pr("octo/b", 2),
+            self._pr("hubot/dotfiles", 3),
+        ]
+        filtered = pr_tui.filter_prs(prs, filter_owner="octo")
+        self.assertEqual([pr.repo for pr in filtered], ["octo/a", "octo/b"])
+
+    def test_filter_prs_by_repo(self):
+        prs = [
+            self._pr("octo/a", 1),
+            self._pr("octo/b", 2),
+            self._pr("hubot/dotfiles", 3),
+        ]
+        filtered = pr_tui.filter_prs(prs, filter_repo="octo/b")
+        self.assertEqual([pr.repo for pr in filtered], ["octo/b"])
+
+    def test_scope_and_text_filters_combine(self):
+        prs = [
+            self._pr("octo/a", 1),
+            self._pr("octo/b", 2),
+            self._pr("hubot/dotfiles", 3),
+        ]
+        filtered = pr_tui.filter_prs(prs, filter_owner="octo", filter_text="b")
+        self.assertEqual([pr.repo for pr in filtered], ["octo/b"])
+
+
 class SelfUpdateTests(unittest.TestCase):
     def test_default_update_repo_is_configured(self):
         self.assertEqual(pr_tui.DEFAULT_UPDATE_REPO, "c-gerke/pr-tui")

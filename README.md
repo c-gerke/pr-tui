@@ -101,12 +101,18 @@ Use a different GitHub search query when you want a broader queue:
 | `e` | Enable auto-merge for selected or marked PRs, with merge method prompt |
 | `m` | Merge selected or marked PRs: squash, merge commit, rebase, or auto |
 | `/` | Filter the loaded PR list locally |
+| `@` | Filter to the selected PR's owner/org (press again to clear) |
+| `#` | Filter to the selected PR's repository (press again to clear) |
+| `U` | Clear owner and repo scope filters |
 | `r` / `F5` | Refresh PRs |
 | `Tab` | Cycle the focused pane |
 | `q` / `Esc` | Quit |
 
 When one or more PRs are marked, `a`, `e`, `m`, `o`, and `w` apply to all marked
 PRs. With no marks, those actions apply to the cursor PR only.
+
+Scope filters (`@`, `#`) match exactly on owner or repository. They combine with
+the free-text `/` filter.
 
 ## Useful Options
 
