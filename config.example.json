@@ -1,0 +1,9 @@
+{
+  "auto_merge": {
+    "method": "squash"
+  },
+  "merge": {
+    "method": "squash",
+    "delete_branch": true
+  }
+}

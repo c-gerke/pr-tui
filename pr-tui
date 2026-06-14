@@ -35,6 +35,24 @@ VIEW_FIELDS = (
 CHECK_FIELDS = "bucket,completedAt,description,event,link,name,startedAt,state,workflow"
 DEFAULT_UPDATE_REPO = "c-gerke/pr-tui"
 RELEASE_ASSET = "pr-tui"
+AUTO_MERGE_METHODS = {
+    "squash": "s",
+    "merge": "m",
+    "rebase": "r",
+    "default": "d",
+}
+MERGE_METHODS = {
+    "squash": "s",
+    "merge": "m",
+    "rebase": "r",
+    "auto": "a",
+}
+AUTO_MERGE_KEY_NAMES = {value: key for key, value in AUTO_MERGE_METHODS.items()}
+MERGE_KEY_NAMES = {value: key for key, value in MERGE_METHODS.items()}
+
+
+class ConfigError(Exception):
+    pass
 
 
 class GhError(Exception):
@@ -60,6 +78,13 @@ class Args:
     state: str
     refresh_seconds: int
     include_drafts: bool
+
+
+@dataclass
+class Config:
+    auto_merge_method: str | None = None
+    merge_method: str | None = None
+    merge_delete_branch: bool | None = None
 
 
 @dataclass
@@ -203,6 +228,74 @@ def resolve_action_targets(state: State) -> list[PullRequest]:
     return [current] if current else []
 
 
+def default_config_paths() -> list[pathlib.Path]:
+    home = pathlib.Path.home()
+    return [
+        home / ".config" / "pr-tui" / "config.json",
+        home / ".pr-tui.json",
+    ]
+
+
+def resolve_config_path(cli_path: str | None) -> pathlib.Path | None:
+    if cli_path:
+        return pathlib.Path(cli_path).expanduser()
+    env = os.environ.get("PR_TUI_CONFIG")
+    if env:
+        return pathlib.Path(env).expanduser()
+    for path in default_config_paths():
+        if path.exists():
+            return path
+    return None
+
+
+def parse_method_name(value: Any, allowed: dict[str, str], field: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{field} must be a string")
+    key = value.lower()
+    if key not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigError(f"invalid {field}: {value!r} (expected one of: {choices})")
+    return allowed[key]
+
+
+def load_config(path: pathlib.Path | None) -> Config:
+    if path is None or not path.exists():
+        return Config()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(f"config root must be a JSON object in {path}")
+
+    auto_merge = raw.get("auto_merge") or {}
+    merge = raw.get("merge") or {}
+    if not isinstance(auto_merge, dict):
+        raise ConfigError("auto_merge must be an object")
+    if not isinstance(merge, dict):
+        raise ConfigError("merge must be an object")
+
+    config = Config()
+    if "method" in auto_merge:
+        config.auto_merge_method = parse_method_name(
+            auto_merge["method"],
+            AUTO_MERGE_METHODS,
+            "auto_merge.method",
+        )
+    if "method" in merge:
+        config.merge_method = parse_method_name(
+            merge["method"],
+            MERGE_METHODS,
+            "merge.method",
+        )
+    if "delete_branch" in merge:
+        value = merge["delete_branch"]
+        if not isinstance(value, bool):
+            raise ConfigError("merge.delete_branch must be a boolean")
+        config.merge_delete_branch = value
+    return config
+
+
 def main() -> int:
     parsed = parse_args()
     if parsed.self_update:
@@ -217,10 +310,15 @@ def main() -> int:
         include_drafts=parsed.include_drafts,
     )
     try:
+        config = load_config(resolve_config_path(parsed.config))
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    try:
         if parsed.smoke_test:
-            curses.wrapper(lambda stdscr: App(stdscr, args).smoke_test())
+            curses.wrapper(lambda stdscr: App(stdscr, args, config).smoke_test())
         else:
-            curses.wrapper(lambda stdscr: App(stdscr, args).run())
+            curses.wrapper(lambda stdscr: App(stdscr, args, config).run())
     except KeyboardInterrupt:
         return 130
     return 0
@@ -270,13 +368,18 @@ def parse_args() -> argparse.Namespace:
         "--update-target",
         help="Executable path to replace. Defaults to the current pr-tui executable.",
     )
+    parser.add_argument(
+        "--config",
+        help="Path to a JSON config file. Overrides PR_TUI_CONFIG and default paths.",
+    )
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 class App:
-    def __init__(self, stdscr: curses.window, args: Args):
+    def __init__(self, stdscr: curses.window, args: Args, config: Config | None = None):
         self.stdscr = stdscr
+        self.config = config or Config()
         self.state = State(args=args)
         self.colors: dict[str, int] = {}
 
@@ -559,14 +662,11 @@ class App:
             self.state.status = "No PR selected."
             return
         label = self.batch_label(prs)
-        choice = self.prompt_choice(
-            f"Merge {label}: [s]quash [m]erge [r]ebase [a]uto [Esc] cancel",
-            {"s", "m", "r", "a"},
-        )
+        choice = self.resolve_merge_choice(label)
         if not choice:
             return
         if choice == "a":
-            method = self.prompt_auto_merge_method()
+            method = self.resolve_auto_merge_method()
             if not method:
                 return
             self.run_batch_action(
@@ -577,7 +677,7 @@ class App:
             )
             return
         flag = {"s": "--squash", "m": "--merge", "r": "--rebase"}[choice]
-        delete_branch = self.confirm("Delete branch after merge?", default=False)
+        delete_branch = self.resolve_delete_branch()
 
         def build_merge_command(pr: PullRequest) -> list[str]:
             command = ["gh", "pr", "merge", str(pr.number), "-R", pr.repo, flag]
@@ -594,7 +694,7 @@ class App:
             return
         if not self.confirm(f"Enable auto-merge for {self.batch_label(prs)}?"):
             return
-        method = self.prompt_auto_merge_method()
+        method = self.resolve_auto_merge_method()
         if not method:
             return
         self.run_batch_action(
@@ -603,6 +703,32 @@ class App:
             "Auto-merge enabled for",
             refresh=True,
         )
+
+    def note_config_setting(self, key: str, value: str) -> None:
+        self.state.status = f"Using config: {key}={value}"
+
+    def resolve_auto_merge_method(self) -> str | None:
+        if self.config.auto_merge_method:
+            label = AUTO_MERGE_KEY_NAMES[self.config.auto_merge_method]
+            self.note_config_setting("auto_merge.method", label)
+            return self.config.auto_merge_method
+        return self.prompt_auto_merge_method()
+
+    def resolve_merge_choice(self, label: str) -> str | None:
+        if self.config.merge_method:
+            choice = self.config.merge_method
+            self.note_config_setting("merge.method", MERGE_KEY_NAMES[choice])
+            return choice
+        return self.prompt_choice(
+            f"Merge {label}: [s]quash [m]erge [r]ebase [a]uto [Esc] cancel",
+            {"s", "m", "r", "a"},
+        )
+
+    def resolve_delete_branch(self) -> bool:
+        if self.config.merge_delete_branch is not None:
+            self.note_config_setting("merge.delete_branch", str(self.config.merge_delete_branch).lower())
+            return self.config.merge_delete_branch
+        return self.confirm("Delete branch after merge?", default=False)
 
     def prompt_auto_merge_method(self) -> str | None:
         return self.prompt_choice(
@@ -617,7 +743,7 @@ class App:
         return command
 
     def auto_merge_command(self, pr: PullRequest) -> list[str] | None:
-        method = self.prompt_auto_merge_method()
+        method = self.resolve_auto_merge_method()
         if not method:
             return None
         return self.build_auto_merge_command(pr, method)

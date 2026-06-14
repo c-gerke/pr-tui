@@ -114,6 +114,55 @@ PRs. With no marks, those actions apply to the cursor PR only.
 Scope filters (`@`, `#`) match exactly on owner or repository. They combine with
 the free-text `/` filter.
 
+## Configuration
+
+Optional JSON config supplies defaults for merge and auto-merge sub-prompts.
+When a value is configured, that prompt is skipped. Action confirmations (for
+example `Enable auto-merge for …?` and `Approve …?`) are still required.
+
+Lookup order:
+
+1. `--config PATH`
+2. `PR_TUI_CONFIG` environment variable
+3. `~/.config/pr-tui/config.json`
+4. `~/.pr-tui.json`
+
+Copy the included example to get started:
+
+```sh
+mkdir -p ~/.config/pr-tui
+cp config.example.json ~/.config/pr-tui/config.json
+```
+
+Or point `pr-tui` at the example directly while experimenting:
+
+```sh
+./pr-tui --config config.example.json
+```
+
+Example `~/.config/pr-tui/config.json` (same as [`config.example.json`](config.example.json)):
+
+```json
+{
+  "auto_merge": {
+    "method": "squash"
+  },
+  "merge": {
+    "method": "squash",
+    "delete_branch": false
+  }
+}
+```
+
+| Key | Values | Used by |
+| --- | --- | --- |
+| `auto_merge.method` | `squash`, `merge`, `rebase`, `default` | `e`, and `m` when merge method is `auto` |
+| `merge.method` | `squash`, `merge`, `rebase`, `auto` | `m` |
+| `merge.delete_branch` | `true`, `false` | `m` when not using auto |
+
+Invalid config values cause `pr-tui` to exit at startup with an error message.
+A missing config file is fine; all sub-prompts stay interactive.
+
 ## Useful Options
 
 ```text
@@ -124,6 +173,7 @@ the free-text `/` filter.
 --state open|closed     PR state. Default: open.
 --refresh-seconds N     Auto-refresh interval. Default: 300. Use 0 to disable.
 --include-drafts        Include draft PRs in the list.
+--config PATH           Path to a JSON config file.
 --self-update           Update this executable from the latest GitHub release.
 --update-repo OWNER/REPO
                         Repository to update from.

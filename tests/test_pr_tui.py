@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import importlib.machinery
 import io
+import json
 import tempfile
 import pathlib
 import sys
@@ -230,6 +231,52 @@ class ScopeFilterTests(unittest.TestCase):
         ]
         filtered = pr_tui.filter_prs(prs, filter_owner="octo", filter_text="b")
         self.assertEqual([pr.repo for pr in filtered], ["octo/b"])
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_config_returns_defaults(self):
+        missing = pathlib.Path(tempfile.gettempdir()) / "pr-tui-config-missing"
+        config = pr_tui.load_config(missing)
+        self.assertEqual(config, pr_tui.Config())
+
+    def test_load_config_parses_merge_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "auto_merge": {"method": "squash"},
+                        "merge": {"method": "rebase", "delete_branch": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = pr_tui.load_config(path)
+        self.assertEqual(config.auto_merge_method, "s")
+        self.assertEqual(config.merge_method, "r")
+        self.assertTrue(config.merge_delete_branch)
+
+    def test_invalid_auto_merge_method_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"auto_merge": {"method": "fast-forward"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(pr_tui.ConfigError):
+                pr_tui.load_config(path)
+
+    def test_resolve_config_path_prefers_cli_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "custom.json"
+            path.touch()
+            resolved = pr_tui.resolve_config_path(str(path))
+        self.assertEqual(resolved, path)
+
+    def test_default_config_paths_include_xdg_and_home_fallback(self):
+        paths = pr_tui.default_config_paths()
+        self.assertEqual(paths[0], pathlib.Path.home() / ".config" / "pr-tui" / "config.json")
+        self.assertEqual(paths[1], pathlib.Path.home() / ".pr-tui.json")
 
 
 class SelfUpdateTests(unittest.TestCase):
