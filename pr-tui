@@ -1007,7 +1007,7 @@ class App:
     def draw_detail(self, y: int, x: int, height: int, width: int, pr: PullRequest) -> None:
         detail = pr.detail or {}
         review_requests = users_from_review_requests(detail.get("reviewRequests") or [])
-        latest_reviews = latest_reviews(detail.get("latestReviews") or [])
+        review_summaries = latest_reviews(detail.get("latestReviews") or [])
         checks = summarize_status_rollup(detail.get("statusCheckRollup") or [])
         files = detail.get("files") or []
         commits = detail.get("commits") or []
@@ -1021,7 +1021,7 @@ class App:
             f"Review decision: {detail.get('reviewDecision') or '-'}",
             f"Merge state: {detail.get('mergeStateStatus') or '-'} / mergeable={detail.get('mergeable') or '-'}",
             f"Requested reviewers: {', '.join(review_requests) if review_requests else '-'}",
-            f"Latest reviews: {', '.join(latest_reviews) if latest_reviews else '-'}",
+            f"Latest reviews: {', '.join(review_summaries) if review_summaries else '-'}",
             f"Checks: {checks}",
             f"Changes: +{detail.get('additions', 0)} -{detail.get('deletions', 0)} across {detail.get('changedFiles', 0)} files",
             f"Commits: {len(commits)}",
